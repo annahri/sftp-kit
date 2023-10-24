@@ -1,0 +1,289 @@
+#!/usr/bin/env bash
+# shellcheck disable=SC1090
+#
+# sftp-kit - Jailed-SFTP tool
+# author: ahfas.annahri@gmail.com
+
+cmd="$(basename "$0")"
+config_file="${HOME}/.sftp-kit.conf"
+
+msg() { printf '%s\n' "$@"; }
+err() { printf '\033[38;5;196m%s\033[0m\n' "$@"; exit 1; }
+
+usage() {
+    msg "${cmd} - Jailed SFTP kit" \
+        "Limits sftp users to access only their specified directories." " "
+
+    msg "Commands:" \
+        " init      Initialize sftp-kit" \
+        " access    Adds/removes directory access for a user" \
+        " user      Creates/deletes an sftp user" \
+        " reinit    Re-initialize sftp-kit" \
+        " help      Shows this help message"
+}
+
+subcommand() {
+    local command="$1"
+    local action func
+    shift
+
+    subcommands=()
+    args=()
+
+    while [[ $# -ne 0 ]]; do case "$1" in
+        -a) subcommands+=("$2"); shift ;;
+        *) args+=("$1") ;;
+    esac; shift; done
+
+    help_msg="Available subcommands for \`$command\`:\n"
+    for cmd in "${subcommands[@]}"; do
+        help_msg+=" ${cmd}\n"
+    done
+
+    action="${args[0]}"
+
+    if [[ ! "${subcommands[*]}" =~ "${action}" ]]; then
+        echo -e "$help_msg"
+        exit 1
+    fi
+
+    func="sub_${command}_${action}"
+
+    if ! declare -F | grep -q "$func"; then
+        err "Internal error. Function $func not found" \
+            "Please report this to ahfas.annahri@gmail.com"
+    fi
+
+    "$func" "${args[@]:1}"
+}
+
+sub_user_create() {
+    local username="$1"
+    load_config
+
+    while true; do
+        read -srp "Password: " pass1
+        echo
+        read -srp "Confirm: " pass2
+
+        [[ "$pass1" == "$pass2" ]] && break
+        msg "Password doesn't match, try again"
+    done
+
+    useradd -m -s "/bin/bash" \
+        -g "$webserver_group" \
+        -G "$sftp_group" \
+        -d "${sftp_chroot}/${username}" "$username" \
+        && echo "${username}:${pass1}" | chpasswd \
+        && msg "User \"$username\" has been created"
+}
+
+sub_user_delete() {
+    load_config
+    local username="$1"
+
+    for mnt in "${sftp_chroot}/${username}"/*; do
+        msg "Un-mounting and deleting $mnt dir"
+        umount "$mnt" 
+        rmdir "$mnt"
+    done
+
+    if ! userdel -fr "$username"; then
+        err "Error: unable to delete user $username"
+    fi
+
+    msg "User \"$username\" has been deleted"
+}
+
+sub_user_list() {
+    load_config
+
+    msg "SFTP user accounts: "
+    awk -F: -vgroup="$sftp_group" '$1 == group {print "  "$NF}' /etc/group
+}
+
+sub_access_add() {
+    load_config
+    local username="$1"
+    local target="${2%/}"
+    local target_basename target_fullpath
+
+    if [[ -z "$username" ]] || [[ -z "$target" ]]; then
+        err "Error: username and/or target must be specified" \
+            "Usage: $cmd access add <user> <target>"
+    fi
+
+    if [[ ! "$target" ]]; then
+        err "Error: target path must be valid. ${target} doesn't exist."
+    fi
+
+    case "$sftp_method" in
+        acl)
+            setfacl -Rdm "u:${webserver_user}:rwX" "$target"
+            setfacl -Rm  "u:${webserver_user}:rwX" "$target"
+            setfacl -Rdm "u:${username}:rwX" "$target"
+            setfacl -Rm  "u:${username}:rwX" "$target"
+            setfacl -Rdm m:rwX "$target" 
+            setfacl -Rm  m:rwX "$target" 
+            ;;
+        group)
+            chgrp -R "$webserver_group" "${target}"
+            chmod -R g+w "$target"
+            find "$target" -type d -exec chmod g+xs '{}' \;
+            ;;
+    esac
+
+    target_basename=$(basename "$target")
+    target_fullpath="${sftp_chroot}/${username}/${target_basename}"
+
+    mkdir -p "${target_fullpath}"
+
+    if ! mount --bind "$target" "$target_fullpath" &> /dev/null; then
+        err "Error: unable to add $target to ${sftp_chroot}/${username}"
+    fi
+
+    msg "The ${target} dir is now accessible by ${username}"
+}
+
+sub_access_remove() {
+    load_config
+    local username="$1"
+    local target="${2%/}"
+    local target_basename target_fullpath
+
+    if [[ -z "$username" ]] || [[ -z "$target" ]]; then
+        err "Error: username and/or target must be specified" \
+            "Usage: $cmd access add <user> <target>"
+    fi
+
+    case "$sftp_method" in
+        acl)
+            setfacl -Rdx "u:${username}" "${target}"
+            setfacl -Rx  "u:${username}" "${target}"
+            ;;
+    esac
+
+    target_basename=$(basename "$target")
+    target_fullpath="${sftp_chroot}/${username}/${target_basename}"
+
+    if [[ ! -f "$target_fullpath" ]]; then
+        err "Error: ${target_basename} has already removed from ${username} access"
+    fi
+
+    if ! umount "$target_fullpath" &> /dev/null; then
+        err "Error: unable to remove ${target_basename} from ${username} access" \
+            "Please manually run: umount $target_fullpath"
+    fi
+
+    msg "The ${target} access has now removed from ${username}"
+}
+
+sub_access_list() {
+    load_config
+    mounts=$(findmnt --noheadings --list --output target,source \
+        | grep '^/sftp' \
+        | sed -E 's/[a-zA-Z0-9/]+\[(.*)\]/\1/' \
+        | awk '{$1=$1}1' \
+    )
+
+    while read -r target source; do
+        user=$(sed -E 's|^/.*/(.*)/.*$|\1|' <<< "$target")
+        if [[ "$user" != "$last_user" ]]; then
+            msg "User: $user"
+        fi
+        msg "  - $target => $source"
+        last_user="$user"
+    done <<< "$mounts"
+}
+
+sub_init() {
+    if [[ -f "$config_file" ]]; then
+        err "Config file already exist" \
+            "Force re-intialization by running: $cmd reinit"
+    fi
+
+    read -rp "Specify the sftp users group name: [sftp-users] "
+    sftp_group="${REPLY:-sftp-users}"
+    read -rp "Which user the webserver runs as: [www-data] "
+    webserver_user="${REPLY:-www-data}"
+    read -rp "Which group the webserver runs as: [www-data] "
+    webserver_group="${REPLY:-www-data}"
+    read -rp "Specify the sftp chroot dir: [/sftp] "
+    sftp_chroot="${REPLY:-/sftp}"
+
+    while true; do
+        read -rp "Shared directory method: [group] "
+        sftp_method="${REPLY:-group}"
+
+        [[ ${sftp_method,,} =~ (group|acl) ]] && break
+        msg "Allowed options: group, acl"
+    done
+
+
+    printf '%s="%s"\n' \
+        "sftp_group" "$sftp_group" \
+        "webserver_user" "$webserver_user" \
+        "webserver_group" "$webserver_group" \
+        "sftp_chroot" "$sftp_chroot" \
+        "sftp_method" "$sftp_method" > "$config_file"
+
+    groupadd -f "$sftp_group"
+    mkdir -p "$sftp_chroot"
+
+    sshd_config="\
+# SFTP-KIT BEGIN
+Match Group ${sftp_group}
+    ForceCommand internal-sftp -u 002
+    ChrootDirectory ${sftp_chroot}/%u
+# SFTP-KIT END"
+   
+    if grep -qF "$sshd_config" /etc/ssh/sshd_config; then
+        err "Error: something's wrong. The config is already set in sshd_config" \
+            "Please manually check it"
+    fi
+
+    cp /etc/ssh/sshd_config /etc/ssh/sshd_config.orig-kit
+    echo "$sshd_config" >> /etc/ssh/sshd_config
+    sshd -t \
+        && systemctl restart sshd
+}
+
+sub_reinit() {
+    load_config
+    rm -f "$config_file"
+
+    groupdel -f "$sftp_group"
+    if [[ -f /etc/ssh/sshd_config.orig-kit ]]; then
+        mv -f /etc/ssh/sshd_config.orig-kit /etc/ssh/sshd_config
+    fi
+
+    sub_init
+}
+
+load_config() {
+    if [[ ! -f "${config_file}" ]]; then
+        err "Config file not found" \
+            "Please initialize first using: $cmd init"
+    fi
+
+    . "${config_file}"
+}
+
+main() {
+    action="$1"
+    shift
+
+    if [[ -z "$action" ]]; then
+        usage
+        exit
+    fi
+
+    case "$action" in
+        init|reinit) sub_"$action" ;;
+        access) subcommand "$action" -a add -a remove -a list "$@" ;;
+        user)   subcommand "$action" -a create -a delete -a list "$@" ;;
+        help|*) usage; exit ;;
+    esac
+}
+
+main "$@"
